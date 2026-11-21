@@ -1,0 +1,186 @@
+================================================================================
+Amazon S3 Tables Replication Lab — CLI cheat sheet
+Full walkthrough: ../README.md
+================================================================================
+
+source ./env.sh
+
+--------------------------------------------------------------------------------
+1) CREATE SOURCE TABLE BUCKET + SET ARN
+--------------------------------------------------------------------------------
+
+aws s3tables create-table-bucket \
+  --name "${SOURCE_TABLE_BUCKET}" \
+  --region "${SOURCE_REGION}"
+
+export SOURCE_TABLE_BUCKET_ARN=$(aws s3tables list-table-buckets \
+  --region "${SOURCE_REGION}" \
+  --query "tableBuckets[?name=='${SOURCE_TABLE_BUCKET}'].arn | [0]" \
+  --output text)
+
+echo "SOURCE_TABLE_BUCKET_ARN=${SOURCE_TABLE_BUCKET_ARN}"
+
+--------------------------------------------------------------------------------
+2) CREATE DEST TABLE BUCKET + SET ARN
+--------------------------------------------------------------------------------
+
+aws s3tables create-table-bucket \
+  --name "${DEST_TABLE_BUCKET}" \
+  --region "${DEST_REGION}"
+
+export DEST_TABLE_BUCKET_ARN=$(aws s3tables list-table-buckets \
+  --region "${DEST_REGION}" \
+  --query "tableBuckets[?name=='${DEST_TABLE_BUCKET}'].arn | [0]" \
+  --output text)
+
+echo "DEST_TABLE_BUCKET_ARN=${DEST_TABLE_BUCKET_ARN}"
+
+--------------------------------------------------------------------------------
+3) IAM ROLE FOR REPLICATION
+--------------------------------------------------------------------------------
+
+cat > /tmp/s3tables-replication-trust.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "replication.s3tables.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name "${REPLICATION_ROLE_NAME}" \
+  --assume-role-policy-document file:///tmp/s3tables-replication-trust.json \
+  --description "Role for S3 Tables replication (lab)"
+
+cat > /tmp/s3tables-replication-permissions.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSourceTables",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:GetTable",
+        "s3tables:GetTableMetadataLocation",
+        "s3tables:GetTableMaintenanceConfiguration",
+        "s3tables:GetTableData"
+      ],
+      "Resource": "arn:aws:s3tables:${SOURCE_REGION}:${AWS_ACCOUNT_ID}:bucket/${SOURCE_TABLE_BUCKET}/table/*"
+    },
+    {
+      "Sid": "ListSourceBucket",
+      "Effect": "Allow",
+      "Action": ["s3tables:ListTables"],
+      "Resource": "arn:aws:s3tables:${SOURCE_REGION}:${AWS_ACCOUNT_ID}:bucket/${SOURCE_TABLE_BUCKET}"
+    },
+    {
+      "Sid": "CreateOnDestinationBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:CreateTable",
+        "s3tables:CreateNamespace"
+      ],
+      "Resource": "arn:aws:s3tables:${DEST_REGION}:${AWS_ACCOUNT_ID}:bucket/${DEST_TABLE_BUCKET}"
+    },
+    {
+      "Sid": "WriteDestinationTables",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:PutTableData",
+        "s3tables:GetTableData",
+        "s3tables:UpdateTableMetadataLocation",
+        "s3tables:PutTableMaintenanceConfiguration"
+      ],
+      "Resource": "arn:aws:s3tables:${DEST_REGION}:${AWS_ACCOUNT_ID}:bucket/${DEST_TABLE_BUCKET}/table/*"
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name "${REPLICATION_ROLE_NAME}" \
+  --policy-name S3TablesReplicationPermissions \
+  --policy-document file:///tmp/s3tables-replication-permissions.json
+
+export REPLICATION_ROLE_ARN=$(aws iam get-role \
+  --role-name "${REPLICATION_ROLE_NAME}" \
+  --query 'Role.Arn' --output text)
+
+echo "REPLICATION_ROLE_ARN=${REPLICATION_ROLE_ARN}"
+
+--------------------------------------------------------------------------------
+4) NAMESPACE + TABLE ARN (Athena SQL is in README.md)
+--------------------------------------------------------------------------------
+
+aws s3tables create-namespace \
+  --table-bucket-arn "${SOURCE_TABLE_BUCKET_ARN}" \
+  --namespace "${NAMESPACE}" \
+  --region "${SOURCE_REGION}"
+
+export SOURCE_TABLE_ARN=$(aws s3tables get-table \
+  --table-bucket-arn "${SOURCE_TABLE_BUCKET_ARN}" \
+  --namespace "${NAMESPACE}" \
+  --name "${TABLE_NAME}" \
+  --region "${SOURCE_REGION}" \
+  --query 'tableARN' --output text)
+
+echo "SOURCE_TABLE_ARN=${SOURCE_TABLE_ARN}"
+
+--------------------------------------------------------------------------------
+5) PUT TABLE REPLICATION + STATUS
+--------------------------------------------------------------------------------
+
+aws s3tables put-table-replication \
+  --table-arn "${SOURCE_TABLE_ARN}" \
+  --region "${SOURCE_REGION}" \
+  --configuration "{
+    \"role\": \"${REPLICATION_ROLE_ARN}\",
+    \"rules\": [
+      {
+        \"destinations\": [
+          {
+            \"destinationTableBucketARN\": \"${DEST_TABLE_BUCKET_ARN}\"
+          }
+        ]
+      }
+    ]
+  }"
+
+aws s3tables get-table-replication-status \
+  --table-arn "${SOURCE_TABLE_ARN}" \
+  --region "${SOURCE_REGION}"
+
+--------------------------------------------------------------------------------
+6) DEST TABLE ARN
+--------------------------------------------------------------------------------
+
+export DEST_TABLE_ARN=$(aws s3tables get-table \
+  --table-bucket-arn "${DEST_TABLE_BUCKET_ARN}" \
+  --namespace "${NAMESPACE}" \
+  --name "${TABLE_NAME}" \
+  --region "${DEST_REGION}" \
+  --query 'tableARN' --output text)
+
+echo "DEST_TABLE_ARN=${DEST_TABLE_ARN}"
+
+--------------------------------------------------------------------------------
+7) PROMOTE REPLICA (DISASSOCIATE)
+--------------------------------------------------------------------------------
+
+aws s3tables disassociate-table-replication \
+  --table-arn "${DEST_TABLE_ARN}" \
+  --region "${DEST_REGION}"
+
+--------------------------------------------------------------------------------
+8) CLEANUP
+--------------------------------------------------------------------------------
+
+./clean.sh
+./clean.sh --yes
